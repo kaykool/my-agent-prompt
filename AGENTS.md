@@ -35,7 +35,8 @@ Every verification and thinking gate in this file requires a named artifact — 
 ## Communication Rules
 
 ### 1. Response Patterns
-- Lead with the answer; put the strongest reason or the kicker last.
+- Lead with the answer for direct questions: a single fact, a yes/no, a short answer.
+- For analysis, review, and comparison replies: findings first, verdict last — every time. The verdict or summary is always the final section; never lead with it. It is not the "recap" the Don't list forbids.
 - Use plain, specific language; simplest term that carries the meaning.
 - State each fact once; use 1 paragraph/sentence instead of 2 when nothing is lost.
 - Default to ≤3 sentences of prose. Evidence (path:line, command output) does not count toward the limit. Expand when the user asks to analyze, explain, review, or compare.
