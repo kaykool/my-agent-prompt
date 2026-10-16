@@ -46,6 +46,10 @@ from pathlib import Path
 
 PROG = Path(sys.argv[0]).stem or "script"
 DEFAULT_TIMEOUT = 60.0  # seconds per command; overridden by --timeout
+# Binary upgrades download and unpack releases, and `pacman -S` can run for
+# minutes. They get their own budget: killing an updater at --timeout could
+# leave pacman part-way through a transaction.
+UPDATE_TIMEOUT = 900.0
 
 EXIT_FAIL, EXIT_USAGE, EXIT_LOCKED, EXIT_TIMEOUT, EXIT_INTERRUPT = 1, 2, 75, 124, 130
 
@@ -82,6 +86,26 @@ def emit(text: str = "") -> None:
         if _TTY:
             sys.stderr.write("\r\033[K")
         print(text, file=sys.stderr, flush=True)
+
+
+# OSC, CSI and other escape sequences, plus stray C0 controls. Newline and tab
+# survive so multi-line output still reads properly.
+_CONTROL = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\-_]"
+    r"|[\x00-\x08\x0b-\x1f\x7f]"
+)
+
+
+def _safe(text: str) -> str:
+    """Strip terminal control sequences from output this script did not write.
+
+    Harness updaters run third-party code and their output reaches this
+    terminal. A release note carrying an OSC sequence could otherwise
+    retitle the window or push text onto the clipboard.
+    """
+    return _CONTROL.sub("", text)
 
 
 class Spinner:
@@ -946,7 +970,8 @@ def _maki_status(timeout: float) -> BinaryStatus:
     if binary is None:
         return BinaryStatus("maki", "not installed", "", False, "maki not on PATH")
     out = run([binary, "--version"], timeout=timeout, check=False)
-    text = (out.stdout.strip() or out.stderr.strip()).splitlines()
+    # stdout only: a stderr fallback would treat an error message as a version.
+    text = out.stdout.strip().splitlines()
     current = text[0].strip().split()[-1] if text else "unknown"
     return BinaryStatus("maki", current, "", True, "no remote API; --upgrade runs maki update")
 
@@ -980,7 +1005,9 @@ def _read_version(harness: str, timeout: float) -> str:
             out = run([binary, "version"], timeout=timeout, check=False)
         else:
             out = run([binary, "--version"], timeout=timeout, check=False)
-        text = (out.stdout.strip() or out.stderr.strip()).splitlines()
+        # stdout only: a stderr fallback would treat an error message as a
+        # version, and the per-harness parsers would scrape a number out of it.
+        text = out.stdout.strip().splitlines()
         if not text:
             return ""
         if harness == "pig":
@@ -1033,33 +1060,39 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
                 _snapper_presnapshot(timeout)
                 run_interactive(
                     ["sudo", "pacman", "-S", "--needed", "opencode"],
-                    timeout=timeout,
+                    timeout=UPDATE_TIMEOUT,
                     mutates=True,
                 )
             elif st.harness == "pi":
                 binary = shutil.which("pi") or "pi"
-                run_interactive([binary, "update", "--self"], timeout=timeout, mutates=True)
+                run_interactive(
+                    [binary, "update", "--self"], timeout=UPDATE_TIMEOUT, mutates=True
+                )
             elif st.harness == "pig":
                 binary = shutil.which("pig") or "pig"
-                run_interactive([binary, "update"], timeout=timeout, mutates=True)
+                run_interactive([binary, "update"], timeout=UPDATE_TIMEOUT, mutates=True)
             elif st.harness == "maki":
                 # -y never prompts (verified: exits 0 silently on no-op), so a
                 # captured run() is safe; its "Already up to date" line stays
                 # hidden unless something actually happened.
                 binary = shutil.which("maki") or "maki"
-                result = run([binary, "update", "-y"], timeout=timeout, mutates=True)
+                result = run([binary, "update", "-y"], timeout=UPDATE_TIMEOUT, mutates=True)
                 combined = f"{result.stdout}\n{result.stderr}".strip()
                 if "up to date" not in combined.lower() and combined:
-                    emit(combined)
+                    emit(_safe(combined))
             after = _read_version(st.harness, timeout)
             if DRY_RUN:
                 outcomes[st.harness] = "dry-run"
-            elif before and after and before != after:
+            elif not after:
+                # It ran, but now it cannot report a version. An updater that
+                # breaks its own binary must not read as a successful update.
+                outcomes[st.harness] = f"FAILED: no version after upgrading ({st.harness} looks broken)"
+            elif before and before != after:
                 outcomes[st.harness] = f"updated to {after}"
-            elif before and after:
+            elif before:
                 outcomes[st.harness] = "current"
             else:
-                outcomes[st.harness] = "updated"
+                outcomes[st.harness] = f"updated (version now {after})"
         except ScriptError as err:
             outcomes[st.harness] = f"FAILED: {err}"
     return outcomes
@@ -1358,7 +1391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if err.hint:
             emit(f"{_paint('2', 'hint:')}  {err.hint}")
         if VERBOSE and err.detail:
-            emit(err.detail)
+            emit(_safe(err.detail))
         return err.code
     except KeyboardInterrupt:
         emit(_paint("33", "interrupted"))
