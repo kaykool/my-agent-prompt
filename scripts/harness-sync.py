@@ -435,8 +435,15 @@ def _http_json(url: str, timeout: float, desc: str, api_key: str | None = None) 
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as err:
+        if err.code >= 500:
+            hint = "the gateway itself is failing, nothing to fix on your machine"
+        elif err.code in (401, 403):
+            hint = "its API key looks rejected; check ~/.config/agent-env.sh"
+        else:
+            hint = "rerun with -v to see the response body"
         raise ScriptError(
-            f"could not download {desc}", detail=f"{url} answered HTTP {err.code}"
+            f"could not download {desc}: HTTP {err.code}", hint=hint,
+            detail=f"{url} answered HTTP {err.code}",
         ) from err
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         raise ScriptError(
@@ -719,7 +726,7 @@ def _fix_pi_settings(harness: str, settings_text: str, models_data: dict) -> tup
     try:
         settings = json.loads(settings_text)
     except json.JSONDecodeError as err:
-        raise ScriptError(f"{harness} settings file is broken", detail=str(err)) from err
+        raise ScriptError(f"{harness} settings file does not parse: {err}") from err
     providers = models_data.get("providers") or {}
     order: dict[str, list[str]] = {}
     for prov_id, block in providers.items():
@@ -1040,6 +1047,24 @@ def _snapper_presnapshot(timeout: float) -> None:
         emit("safety snapshot taken")
 
 
+def _drop_script_dump(text: str) -> str:
+    """Remove a shell script echoed inside captured output (maki's updater
+    pastes the whole install script it downloads). The dump runs from its
+    "#!/bin/sh" line to its final 'main "$@"'."""
+    filtered: list[str] = []
+    dump = False
+    for ln in text.splitlines():
+        if dump:
+            if ln == 'main "$@"':
+                dump = False
+            continue
+        if ln.startswith("#!/bin/"):
+            dump = True
+            continue
+        filtered.append(ln)
+    return "\n".join(filtered).strip()
+
+
 def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str, str]:
     """Run each harness's own updater interactively. Must be called outside step().
 
@@ -1079,7 +1104,9 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
                 result = run([binary, "update", "-y"], timeout=UPDATE_TIMEOUT, mutates=True)
                 combined = f"{result.stdout}\n{result.stderr}".strip()
                 if "up to date" not in combined.lower() and combined:
-                    emit(_safe(combined))
+                    shown = _drop_script_dump(combined)
+                    if shown:
+                        emit(_safe(shown))
             after = _read_version(st.harness, timeout)
             if DRY_RUN:
                 outcomes[st.harness] = "dry-run"
@@ -1101,6 +1128,20 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
 # --- planning --------------------------------------------------------------------
 
 
+def _config_parse_error(harness: str, path: Path, old_text: str, err: Exception) -> ScriptError:
+    """Turn a parse failure into advice: what is wrong and where a copy lives."""
+    backup = f"{BACKUP_ROOT} (named {harness}-{path.name})"
+    if not old_text.strip():
+        return ScriptError(
+            f"{harness} settings file is empty: {path}",
+            hint=f"restore a copy from {backup}",
+        )
+    return ScriptError(
+        f"{harness} settings file does not parse: {err}",
+        hint=f"fix the file by hand, or restore a copy from {backup}",
+    )
+
+
 def _plan_target(
     harness: str, path: Path, fmt: str, catalog: dict[str, list[Model]], new_tier: str
 ) -> list[Plan]:
@@ -1111,7 +1152,7 @@ def _plan_target(
         try:
             data = json.loads(strip_jsonc(old_text))
         except json.JSONDecodeError as err:
-            raise ScriptError(f"{harness} settings file is broken", detail=str(err)) from err
+            raise _config_parse_error(harness, path, old_text, err) from err
         new_data, added, removed, created, added_ids, removed_ids = _opencode_update(data, catalog)
         for prov_id in created:
             emit(f"note: {prov_id} was not in {path.name}; added it")
@@ -1123,7 +1164,7 @@ def _plan_target(
         try:
             data = json.loads(old_text)
         except json.JSONDecodeError as err:
-            raise ScriptError(f"{harness} settings file is broken", detail=str(err)) from err
+            raise _config_parse_error(harness, path, old_text, err) from err
         new_data, added, removed, created, added_ids, removed_ids = _pi_update(data, catalog)
         for prov_id in created:
             emit(f"note: {prov_id} was not in {path.name}; added it")
@@ -1153,7 +1194,7 @@ def _plan_target(
         try:
             data = tomllib.loads(old_text)
         except tomllib.TOMLDecodeError as err:
-            raise ScriptError(f"{harness} settings file is broken", detail=str(err)) from err
+            raise _config_parse_error(harness, path, old_text, err) from err
         new_data, added, removed, new_ids, gone_ids, created = _maki_update(
             data, catalog, new_tier
         )
@@ -1211,19 +1252,37 @@ def work(args: argparse.Namespace) -> None:
             )
         for harness, path, _fmt in targets:
             if not path.is_file():
-                raise ScriptError(f"{harness}: settings file not found: {path}")
+                raise ScriptError(
+                    f"{harness}: settings file not found: {path}",
+                    hint=f"a previous copy may be in {BACKUP_ROOT} "
+                    f"(named {harness}-{path.name})",
+                )
 
     catalogs: dict[str, list[Model]] = {}
+    down: list[str] = []
+    first_error: ScriptError | None = None
     with step("Check the online model lists"):
         for gw in GATEWAYS:
-            catalogs[gw.id] = _fetch_models(gw, args.timeout)
-            if not catalogs[gw.id]:
+            try:
+                models = _fetch_models(gw, args.timeout)
+            except ScriptError as err:
+                down.append(gw.id)
+                first_error = first_error or err
+                msg = f"{err} - {err.hint}" if err.hint else f"{err}"
+                emit(f"note: {msg}; {gw.id}'s models were left untouched")
+                continue
+            if not models:
                 raise ScriptError(
                     f"{gw.id} sent an empty list; stopped so none of your files are emptied"
                 )
+            catalogs[gw.id] = models
+        if not catalogs and first_error:
+            raise first_error  # every gateway failed; report the first failure
     detail: list[str] = []
-    counts = ", ".join(f"{gw.id} {len(catalogs[gw.id])}" for gw in GATEWAYS)
+    counts = ", ".join(f"{gid} {len(models)}" for gid, models in catalogs.items())
     detail.append(f"{'catalog':<8}  {counts}")
+    if down:
+        detail.append(f"{'skipped':<8}  {', '.join(down)} (gateway unreachable; models left as-is)")
 
     with step("Compare online lists with your files"):
         plans: list[Plan] = []
