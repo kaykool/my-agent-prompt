@@ -2,13 +2,11 @@
 """Refresh the model lists in your agent configs from the Nutaraline and GutsAI gateways.
 
 Downloads each gateway's live model list and rewrites the harness config files
-listed in catalog.md (opencode jsonc, pi/pig models.json, maki providers.toml),
+listed in catalog.md (opencode jsonc, pi/pig models.json),
 so you never have to ask an AI to update them by hand.
 
 Rules:
 - GutsAI entries with status != "ok" are omitted (they return 404 offline).
-- Maki `tier` is human judgment: existing tiers are kept, brand-new models
-  get tier "weak" (see --new-tier) and are reported for manual review.
 - Fields the gateways do not provide (e.g. GutsAI context windows) fall back
   to the values already in the config file; per-model fields the script does
   not manage (e.g. pi "promptCache") are preserved as-is.
@@ -37,7 +35,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import traceback
 import urllib.error
 import urllib.request
@@ -462,69 +459,6 @@ def _pi_update(data: dict, catalog: dict[str, list[Model]]) -> tuple[dict, int, 
     return data, added, removed
 
 
-# --- maki-toml -----------------------------------------------------------------------
-
-
-def _toml_value(value) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def _serialize_maki(data: dict, header: list[str]) -> str:
-    lines = list(header)
-    for prov_id, block in data.items():
-        lines.append("")
-        lines.append(f"[{prov_id}]")
-        for key, value in block.items():
-            if key != "models":
-                lines.append(f"{key} = {_toml_value(value)}")
-        for m in block.get("models", []):
-            lines.append("")
-            lines.append(f"[[{prov_id}.models]]")
-            for key, value in m.items():
-                lines.append(f"{key} = {_toml_value(value)}")
-    return "\n".join(lines).rstrip("\n") + "\n"
-
-
-_MAKI_MODEL_KNOWN = {"id", "tier", "supports_thinking", "supports_vision"}
-
-
-def _maki_update(
-    data: dict, catalog: dict[str, list[Model]], new_tier: str
-) -> tuple[dict, int, int, list[str]]:
-    added = removed = 0
-    new_ids: list[str] = []
-    for prov_id, models in catalog.items():
-        block = data.get(prov_id)
-        if block is None:
-            continue  # provider absent from maki config; never added silently
-        existing = {m["id"]: m for m in block.get("models", [])}
-        want = {m.id: m for m in models}
-        fresh = []
-        for m in models:
-            old = existing.get(m.id) or {}
-            entry: dict = {
-                "id": m.id,
-                "tier": old.get("tier") or new_tier,
-                "supports_thinking": m.reasoning,
-                "supports_vision": m.vision,
-            }
-            for k, v in _kept(old, _MAKI_MODEL_KNOWN).items():
-                entry.setdefault(k, v)
-            if m.id not in existing:
-                added += 1
-                new_ids.append(f"{prov_id}/{m.id}")
-            fresh.append(entry)
-        removed += len(existing.keys() - want.keys())
-        block["models"] = fresh
-    return data, added, removed, new_ids
-
-
 # --- targets from catalog.md -----------------------------------------------------------
 
 _ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*(?:\|\s*)$")
@@ -595,7 +529,7 @@ def _fetch_models(gateway: Gateway, timeout: float) -> list[Model]:
 # --- the job --------------------------------------------------------------------------------
 
 
-def _plan_target(harness: str, path: Path, fmt: str, catalog: dict[str, list[Model]], new_tier: str) -> Plan:
+def _plan_target(harness: str, path: Path, fmt: str, catalog: dict[str, list[Model]]) -> Plan:
     old_text = path.read_text(encoding="utf-8")
     skipped: list[str] = []
     if fmt == "opencode-jsonc":
@@ -606,27 +540,10 @@ def _plan_target(harness: str, path: Path, fmt: str, catalog: dict[str, list[Mod
         data = json.loads(old_text)
         new_data, added, removed = _pi_update(data, catalog)
         new_text = _serialize_json(new_data)
-    elif fmt == "maki-toml":
-        header = [ln for ln in old_text.splitlines() if ln.lstrip().startswith("#")]
-        if not header:
-            header = [
-                "# Maki providers - generated from each gateway's live /models catalog.",
-                "# GutsAI entries with status != ok are omitted; requesting them returns 404 offline.",
-            ]
-        data = tomllib.loads(old_text)
-        new_data, added, removed, new_ids = _maki_update(data, catalog, new_tier)
-        new_text = _serialize_maki(new_data, header)
-        if new_ids:
-            emit(
-                f"note: {path.name} lists {len(new_ids)} new models, "
-                f"all given tier={new_tier}. Review and adjust them:"
-            )
-            for nid in new_ids:
-                emit(f"  {nid}")
     else:
         raise ScriptError(
             f"{harness} uses an unknown config format {fmt!r}",
-            hint="use one of: opencode-jsonc, pi-models, maki-toml",
+            hint="use one of: opencode-jsonc, pi-models",
         )
     for prov_id in skipped:
         emit(
@@ -675,7 +592,7 @@ def work(args: argparse.Namespace) -> None:
     plans = []
     with step("Work out the new file contents (writes nothing)"):
         for harness, path, fmt in targets:
-            plans.append(_plan_target(harness, path, fmt, catalogs, args.new_tier))
+            plans.append(_plan_target(harness, path, fmt, catalogs))
 
     todo = [p for p in plans if p.new_text != p.old_text]
     if not todo:
@@ -731,10 +648,6 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--catalog", default=str(DEFAULT_CATALOG), metavar="PATH",
         help=f"catalog.md holding the harness target table (default {DEFAULT_CATALOG})",
-    )
-    parser.add_argument(
-        "--new-tier", default="weak", metavar="TIER", choices=["weak", "medium", "strong"],
-        help='tier for models new to maki providers.toml (default "weak")',
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="show tracebacks")
     args = parser.parse_args(argv)

@@ -2,7 +2,7 @@
 """harness-sync: refresh AI harness model lists and update harness binaries.
 
 Fetches the live model catalogs from the Nutaraline and GutsAI gateways and
-rewrites the model sections of opencode, pi, pig and maki configs (agy
+rewrites the model sections of opencode, pi and pig configs (agy
 auto-updates itself on start, so it is skipped). It also updates harness
 binaries via each harness's own updater whenever an update is pending
 (opencode via pacman, which may ask for your sudo password).
@@ -36,7 +36,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import traceback
 import urllib.error
 import urllib.request
@@ -536,22 +535,6 @@ def _new_pi_provider(prov_id: str) -> dict:
     }
 
 
-def _new_maki_provider(prov_id: str) -> dict:
-    meta = {
-        "nutaraline": ("Nutaraline", "https://nutaraline.co.uk/v1", "NUTARALINE_API_KEY"),
-        "gutsai": ("GutsAI", "https://api.gutsai.id/v1", "GUTSAI_API_KEY"),
-    }[prov_id]
-    return {
-        "display_name": meta[0],
-        "protocol": "openai",
-        "base_url": meta[1],
-        "api_key_env": meta[2],
-        "default_model": "",
-        "discover_models": True,
-        "models": [],
-    }
-
-
 # --- jsonc (opencode) ----------------------------------------------------------
 
 
@@ -770,95 +753,6 @@ def _fix_pi_settings(harness: str, settings_text: str, models_data: dict) -> tup
     return _serialize_json(settings), notes
 
 
-# --- maki-toml -----------------------------------------------------------------
-
-
-def _toml_value(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def _serialize_maki(data: dict, header: list[str]) -> str:
-    lines = list(header)
-    for prov_id, block in data.items():
-        lines.append("")
-        lines.append(f"[{prov_id}]")
-        for key, value in block.items():
-            if key != "models":
-                lines.append(f"{key} = {_toml_value(value)}")
-        for m in block.get("models", []):
-            lines.append("")
-            lines.append(f"[[{prov_id}.models]]")
-            for key, value in m.items():
-                lines.append(f"{key} = {_toml_value(value)}")
-    return "\n".join(lines).rstrip("\n") + "\n"
-
-
-_MAKI_MODEL_KNOWN = {"id", "tier", "supports_thinking", "supports_vision"}
-
-
-def _maki_update(
-    data: dict, catalog: dict[str, list[Model]], new_tier: str
-) -> tuple[dict, int, int, list[str], list[str], list[str]]:
-    added = removed = 0
-    new_ids: list[str] = []
-    gone_ids: list[str] = []
-    created: list[str] = []
-    for prov_id, models in catalog.items():
-        block = data.get(prov_id)
-        if block is None:
-            block = _new_maki_provider(prov_id)
-            data[prov_id] = block
-            created.append(prov_id)
-        existing = {m["id"]: m for m in block.get("models", [])}
-        want = {m.id: m for m in models}
-        fresh = []
-        for m in models:
-            old = existing.get(m.id) or {}
-            entry: dict = {
-                "id": m.id,
-                "tier": old.get("tier") or new_tier,
-                "supports_thinking": m.reasoning,
-                "supports_vision": m.vision,
-            }
-            for k, v in _kept(old, _MAKI_MODEL_KNOWN).items():
-                entry.setdefault(k, v)
-            if m.id not in existing:
-                added += 1
-                new_ids.append(f"{prov_id}/{m.id}")
-            fresh.append(entry)
-        gone = sorted(existing.keys() - want.keys())
-        removed += len(gone)
-        gone_ids.extend(f"{prov_id}/{m}" for m in gone)
-        block["models"] = fresh
-    return data, added, removed, new_ids, gone_ids, created
-
-
-def _maki_fix_default(data: dict) -> list[str]:
-    """Repair default_model entries pointing at removed models."""
-    notes: list[str] = []
-    for prov_id, block in data.items():
-        if not isinstance(block, dict):
-            continue
-        models = block.get("models") or []
-        ids = [m.get("id") for m in models if m.get("id")]
-        if not ids:
-            continue
-        default = str(block.get("default_model") or "")
-        mid = default.split("/", 1)[1] if "/" in default else default
-        if mid in ids:
-            continue
-        strong = next((m["id"] for m in models if m.get("tier") == "strong"), ids[0])
-        block["default_model"] = f"{prov_id}/{strong}"
-        notes.append(f"{prov_id} default {default or '(empty)'} is gone; switched to {prov_id}/{strong}")
-    return notes
-
-
 # --- targets from catalog.md -----------------------------------------------------
 
 
@@ -972,17 +866,6 @@ def _pig_status(timeout: float) -> BinaryStatus:
     return BinaryStatus("pig", current, latest, latest != current)
 
 
-def _maki_status(timeout: float) -> BinaryStatus:
-    binary = shutil.which("maki")
-    if binary is None:
-        return BinaryStatus("maki", "not installed", "", False, "maki not on PATH")
-    out = run([binary, "--version"], timeout=timeout, check=False)
-    # stdout only: a stderr fallback would treat an error message as a version.
-    text = out.stdout.strip().splitlines()
-    current = text[0].strip().split()[-1] if text else "unknown"
-    return BinaryStatus("maki", current, "", True, "no remote API; --upgrade runs maki update")
-
-
 def _check_binaries(timeout: float) -> list[BinaryStatus]:
     """Collect versions. Per-harness failures become notes, never aborts."""
     statuses: list[BinaryStatus] = []
@@ -990,7 +873,6 @@ def _check_binaries(timeout: float) -> list[BinaryStatus]:
         ("opencode", _opencode_status),
         ("pi", _pi_status),
         ("pig", _pig_status),
-        ("maki", _maki_status),
     ):
         try:
             statuses.append(func(timeout))
@@ -1019,8 +901,6 @@ def _read_version(harness: str, timeout: float) -> str:
             return ""
         if harness == "pig":
             return text[0].split(":")[-1].strip()  # first line is "pig: 0.4.1"
-        if harness == "maki":
-            return text[0].strip().split()[-1]  # "maki 0.6.3"
         return text[0].strip()  # pi prints the bare version
     except (ScriptError, OSError, IndexError, ValueError):
         return ""
@@ -1047,29 +927,10 @@ def _snapper_presnapshot(timeout: float) -> None:
         emit("safety snapshot taken")
 
 
-def _drop_script_dump(text: str) -> str:
-    """Remove a shell script echoed inside captured output (maki's updater
-    pastes the whole install script it downloads). The dump runs from its
-    "#!/bin/sh" line to its final 'main "$@"'."""
-    filtered: list[str] = []
-    dump = False
-    for ln in text.splitlines():
-        if dump:
-            if ln == 'main "$@"':
-                dump = False
-            continue
-        if ln.startswith("#!/bin/"):
-            dump = True
-            continue
-        filtered.append(ln)
-    return "\n".join(filtered).strip()
-
-
 def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str, str]:
     """Run each harness's own updater interactively. Must be called outside step().
 
-    Returns {harness: outcome}. Updaters run only when an update is pending
-    (or the harness has no remote check, like maki).
+    Returns {harness: outcome}. Updaters run only when an update is pending.
     """
     outcomes: dict[str, str] = {}
     for st in statuses:
@@ -1096,17 +957,6 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
             elif st.harness == "pig":
                 binary = shutil.which("pig") or "pig"
                 run_interactive([binary, "update"], timeout=UPDATE_TIMEOUT, mutates=True)
-            elif st.harness == "maki":
-                # -y never prompts (verified: exits 0 silently on no-op), so a
-                # captured run() is safe; its "Already up to date" line stays
-                # hidden unless something actually happened.
-                binary = shutil.which("maki") or "maki"
-                result = run([binary, "update", "-y"], timeout=UPDATE_TIMEOUT, mutates=True)
-                combined = f"{result.stdout}\n{result.stderr}".strip()
-                if "up to date" not in combined.lower() and combined:
-                    shown = _drop_script_dump(combined)
-                    if shown:
-                        emit(_safe(shown))
             after = _read_version(st.harness, timeout)
             if DRY_RUN:
                 outcomes[st.harness] = "dry-run"
@@ -1143,7 +993,7 @@ def _config_parse_error(harness: str, path: Path, old_text: str, err: Exception)
 
 
 def _plan_target(
-    harness: str, path: Path, fmt: str, catalog: dict[str, list[Model]], new_tier: str
+    harness: str, path: Path, fmt: str, catalog: dict[str, list[Model]]
 ) -> list[Plan]:
     """Build write plans for one catalog row (models file plus settings fixes)."""
     old_text = path.read_text(encoding="utf-8")
@@ -1184,38 +1034,10 @@ def _plan_target(
                 plans.append(
                     Plan(harness, settings_path, "pi-settings", fixed, old_settings, 0, 0)
                 )
-    elif fmt == "maki-toml":
-        header = [ln for ln in old_text.splitlines() if ln.lstrip().startswith("#")]
-        if not header:
-            header = [
-                "# Maki providers - generated from each gateway's live /models catalog.",
-                "# GutsAI entries with status != ok are omitted; requesting them returns 404 offline.",
-            ]
-        try:
-            data = tomllib.loads(old_text)
-        except tomllib.TOMLDecodeError as err:
-            raise _config_parse_error(harness, path, old_text, err) from err
-        new_data, added, removed, new_ids, gone_ids, created = _maki_update(
-            data, catalog, new_tier
-        )
-        for prov_id in created:
-            emit(f"note: {prov_id} was not in {path.name}; added it")
-        default_notes = _maki_fix_default(new_data)
-        for note in default_notes:
-            emit(f"note: {harness}: {note}")
-        if new_ids:
-            emit(
-                f"note: {path.name} has {len(new_ids)} new models "
-                f"(marked {new_tier}; check them when you can)."
-            )
-        plans.append(
-            Plan(harness, path, fmt, _serialize_maki(new_data, header), old_text,
-                 added, removed, added_ids=new_ids, removed_ids=gone_ids)
-        )
     else:
         raise ScriptError(
             f"{harness} has a settings type I don't know: {fmt}",
-            hint="use one of: opencode-jsonc, pi-models, maki-toml",
+            hint="use one of: opencode-jsonc, pi-models",
         )
     return plans
 
@@ -1287,7 +1109,7 @@ def work(args: argparse.Namespace) -> None:
     with step("Compare online lists with your files"):
         plans: list[Plan] = []
         for harness, path, fmt in targets:
-            plans.extend(_plan_target(harness, path, fmt, catalogs, args.new_tier))
+            plans.extend(_plan_target(harness, path, fmt, catalogs))
 
     with step("Check program versions"):
         statuses = _check_binaries(args.timeout)
@@ -1406,13 +1228,6 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=str(DEFAULT_CATALOG),
         metavar="PATH",
         help=f"catalog.md holding the harness target table (default {DEFAULT_CATALOG})",
-    )
-    parser.add_argument(
-        "--new-tier",
-        default="weak",
-        metavar="TIER",
-        choices=["weak", "medium", "strong"],
-        help='tier for models new to maki providers.toml (default "weak")',
     )
     parser.add_argument(
         "--diff",
