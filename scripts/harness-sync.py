@@ -346,7 +346,6 @@ class Model:
     context: int | None = None
     output: int | None = None
     reasoning: bool = False
-    vision: bool = False
     tools: bool = False
     inputs: list[str] = field(default_factory=lambda: ["text"])
     efforts: list[str] = field(default_factory=list)
@@ -390,7 +389,6 @@ def _normalize_nutaraline(raw: list[dict]) -> list[Model]:
                 context=context if isinstance(context, int) else None,
                 output=output if isinstance(output, int) else None,
                 reasoning=bool(caps.get("reasoning")),
-                vision=bool(caps.get("vision")),
                 tools=bool(caps.get("tools", True)),
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=[str(e) for e in efforts],
@@ -412,7 +410,6 @@ def _normalize_gutsai(raw: list[dict]) -> list[Model]:
                 context=None,  # gutsai does not report context windows
                 output=None,
                 reasoning=bool(m.get("supports_reasoning")),
-                vision=bool(m.get("supports_vision")),
                 tools=True,  # gutsai does not report tool support; configs assume true
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=[],
@@ -794,7 +791,7 @@ class BinaryStatus:
     harness: str
     current: str
     latest: str  # "" when the latest version cannot be checked
-    update: bool  # True when an update is available (or unknown but updater exists)
+    update: bool  # True when an update is available
     note: str = ""
 
 
@@ -1121,8 +1118,6 @@ def work(args: argparse.Namespace) -> None:
             state = "check failed"
         elif st.update and st.latest:
             state = f"-> {st.latest}"
-        elif st.update:
-            state = "latest unknown"
         else:
             state = "current"
         detail.append(f"{st.harness:<8}  {st.current:<{vw}}  {state}")

@@ -2,10 +2,9 @@
 """rules-sync: propagate the canonical AGENTS.md rules to every AI harness.
 
 The repo AGENTS.md is the source. harness-list.md maps each harness to its
-rules file and mode ("md" installs the rules verbatim). Only files whose
-content actually changes are written; the first write to an existing file
-leaves a one-time <file>.bak copy. --dry-run previews the unified diffs and
-writes nothing.
+base directory and rules file. Only files whose content actually changes are
+written; the first write to an existing file leaves a one-time <file>.bak
+copy. --dry-run previews the unified diffs and writes nothing.
 
 Status output (notes, errors) goes to stderr; results go to stdout,
 so `rules-sync | other-tool` and `rules-sync > file` stay clean.
@@ -36,7 +35,6 @@ VERBOSE = False
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SOURCE = REPO_ROOT / "AGENTS.md"
 DEFAULT_LIST = REPO_ROOT / "harness-list.md"
-MODES = ("md",)
 
 _TTY = sys.stderr.isatty() and os.environ.get("TERM") != "dumb"
 _COLOR = _TTY and "NO_COLOR" not in os.environ
@@ -141,11 +139,9 @@ def expand_base(raw: str) -> str:
     return value
 
 
-def parse_harness_list(
-    text: str, origin: Path
-) -> list[tuple[str, Path, Path, str]]:
-    """Parse the markdown table: harness | base_dir | rules file | mode."""
-    targets: list[tuple[str, Path, Path, str]] = []
+def parse_harness_list(text: str, origin: Path) -> list[tuple[str, Path, Path]]:
+    """Parse the markdown table: harness | base_dir | rules file."""
+    targets: list[tuple[str, Path, Path]] = []
     problems: list[str] = []
     for lineno, line in enumerate(text.splitlines(), 1):
         line = line.rstrip("\r").strip()
@@ -155,23 +151,20 @@ def parse_harness_list(
         label = cells[0]
         if label == "harness" or (label and set(label) <= {"-", ":"}) or not any(cells):
             continue
-        if len(cells) < 4 or not all(cells[:4]):
-            problems.append(f"line {lineno}: need 4 filled columns: {line}")
+        if len(cells) < 3 or not all(cells[:3]):
+            problems.append(f"line {lineno}: need 3 filled columns: {line}")
             continue
-        base, filename, mode = cells[1], cells[2], cells[3]
-        if mode not in MODES:
-            problems.append(f"line {lineno}: unknown mode {mode!r} (want md)")
-            continue
+        base, filename = cells[1], cells[2]
         try:
             base_dir = Path(expand_base(base))
         except ScriptError as err:
             problems.append(f"line {lineno}: {err}")
             continue
-        targets.append((label, base_dir, base_dir / filename, mode))
+        targets.append((label, base_dir, base_dir / filename))
     if problems:
         raise ScriptError(
             f"{len(problems)} bad row(s) in {origin}: " + "; ".join(problems[:3]),
-            hint="each data row needs harness | base_dir | rules file | mode",
+            hint="each data row needs harness | base_dir | rules file",
         )
     if not targets:
         raise ScriptError(f"no sync targets parsed from {origin}")
@@ -213,7 +206,7 @@ def work(args: argparse.Namespace) -> None:
     summary = ""
     try:
         with step("Sync harness rules") as info:
-            for label, base_dir, path, _mode in targets:
+            for label, base_dir, path in targets:
                 existed = path.is_file()
                 if path.exists() and not existed:
                     emit(f"  {BAD} {label}: not a regular file ({_pretty(path)})")

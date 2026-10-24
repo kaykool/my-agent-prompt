@@ -207,7 +207,6 @@ class Model:
     context: int | None = None
     output: int | None = None
     reasoning: bool = False
-    vision: bool = False
     tools: bool = False
     inputs: list[str] = field(default_factory=lambda: ["text"])
     efforts: list[str] = field(default_factory=list)
@@ -248,7 +247,6 @@ def _normalize_nutaraline(raw: list[dict]) -> list[Model]:
                 context=caps.get("contextWindow") or _nested(m, "top_provider", "context_length"),
                 output=caps.get("maxOutput") or _nested(m, "top_provider", "max_completion_tokens"),
                 reasoning=bool(caps.get("reasoning")),
-                vision=bool(caps.get("vision")),
                 tools=bool(caps.get("tools", True)),
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=efforts,
@@ -270,7 +268,6 @@ def _normalize_gutsai(raw: list[dict]) -> list[Model]:
                 context=None,  # gutsai does not report context windows
                 output=None,
                 reasoning=bool(m.get("supports_reasoning")),
-                vision=bool(m.get("supports_vision")),
                 tools=True,  # gutsai does not report tool support; configs assume true
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=[],
