@@ -5,7 +5,9 @@ Fetches the live model catalogs from the Nutaraline and GutsAI gateways and
 rewrites the model sections of opencode, pi and pig configs (agy
 auto-updates itself on start, so it is skipped). It also updates harness
 binaries via each harness's own updater whenever an update is pending
-(opencode via pacman, which may ask for your sudo password).
+(opencode via pacman, which may ask for your sudo password). After that it
+updates each harness's extensions (`pi|pig update --extensions`,
+`opencode plugin update`).
 
 It speaks plainly: `Models are up to date.` or `Updated models in:
 opencode (+34).`, plus one line for programs. Rerun with -v for the
@@ -254,11 +256,16 @@ def run(
 
 
 def run_interactive(
-    cmd: Sequence[str | Path], *, timeout: float | None = None, mutates: bool = False
+    cmd: Sequence[str | Path],
+    *,
+    timeout: float | None = None,
+    mutates: bool = False,
+    label: str | None = None,
 ) -> None:
     """Run a command that needs the terminal (sudo password, package-manager prompts).
 
-    Do not wrap this in step(): the spinner would fight the prompt.
+    Do not wrap this in step(): the spinner would fight the prompt. `label` is
+    printed first, so the command's own output is clearly attributed.
     """
     if not cmd:
         raise ScriptError("empty command sequence")
@@ -268,6 +275,8 @@ def run_interactive(
         emit(f"{_paint('33', 'dry-run')} {shlex.join(argv)}")
         return
     require(argv[0])
+    if label:
+        emit(f"{_paint('36', '->')} {label}")
     try:
         status = subprocess.run(argv, timeout=timeout, check=False).returncode
     except subprocess.TimeoutExpired:
@@ -349,6 +358,7 @@ class Model:
     tools: bool = False
     inputs: list[str] = field(default_factory=lambda: ["text"])
     efforts: list[str] = field(default_factory=list)
+    free: bool = False  # costs nothing: used to pick the default model
 
 
 def _nested(obj: dict, *path: str) -> object:
@@ -382,6 +392,8 @@ def _normalize_nutaraline(raw: list[dict]) -> list[Model]:
         modal = (m.get("architecture") or {}).get("input_modalities") or ["text"]
         context = caps.get("contextWindow") or _nested(m, "top_provider", "context_length")
         output = caps.get("maxOutput") or _nested(m, "top_provider", "max_completion_tokens")
+        pricing = m.get("pricing") or {}
+        free = bool(pricing.get("free")) or (pricing.get("discount_percent") or 0) >= 100
         models.append(
             Model(
                 id=m["id"],
@@ -392,6 +404,7 @@ def _normalize_nutaraline(raw: list[dict]) -> list[Model]:
                 tools=bool(caps.get("tools", True)),
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=[str(e) for e in efforts],
+                free=free,
             )
         )
     return models
@@ -413,6 +426,9 @@ def _normalize_gutsai(raw: list[dict]) -> list[Model]:
                 tools=True,  # gutsai does not report tool support; configs assume true
                 inputs=[x for x in modal if x in ("text", "image")] or ["text"],
                 efforts=[],
+                # price_per_1m 0 means free; the image model also reports
+                # price_per_image, so it is not a free text model.
+                free=m.get("price_per_1m") == 0 and m.get("price_per_image") is None,
             )
         )
     return models
@@ -698,8 +714,20 @@ def _model_ref_alive(ref: str, avail: dict[str, set[str]]) -> bool:
     return mid in avail.get(prov, set())
 
 
-def _fix_pi_settings(harness: str, settings_text: str, models_data: dict) -> tuple[str | None, list[str]]:
+def _fix_pi_settings(
+    harness: str,
+    settings_text: str,
+    models_data: dict,
+    managed: set[str],
+    free: Sequence[tuple[str, str]] = (),
+) -> tuple[str | None, list[str]]:
     """Prune outdated enabledModels and repair a dangling defaultModel.
+
+    Only providers in `managed` (the refreshed gateways) are touched; refs to
+    built-in providers such as anthropic are not in models.json and must stay.
+
+    When `free` (ordered (provider, id) pairs) is not empty, the default is
+    forced to a free model: the current one if it is free, else the first.
 
     Returns (new_text or None when unchanged, notes).
     """
@@ -717,7 +745,11 @@ def _fix_pi_settings(harness: str, settings_text: str, models_data: dict) -> tup
 
     enabled = settings.get("enabledModels")
     if isinstance(enabled, list):
-        kept = [m for m in enabled if isinstance(m, str) and _model_ref_alive(m, avail)]
+        kept = [
+            m for m in enabled
+            if not (isinstance(m, str) and m.split("/", 1)[0] in managed)
+            or _model_ref_alive(m, avail)
+        ]
         dropped = [m for m in enabled if m not in kept]
         if dropped:
             settings["enabledModels"] = kept
@@ -726,7 +758,14 @@ def _fix_pi_settings(harness: str, settings_text: str, models_data: dict) -> tup
 
     prov = settings.get("defaultProvider")
     model = settings.get("defaultModel")
-    if isinstance(prov, str) and isinstance(model, str):
+    mid_now = model.split("/", 1)[1] if isinstance(model, str) and "/" in model else model
+    if free:
+        if (prov, mid_now) not in free:
+            new_prov, new_mid = free[0]
+            settings["defaultProvider"], settings["defaultModel"] = new_prov, new_mid
+            notes.append(f"default {prov}/{model} is not free; switched to {new_prov}/{new_mid}")
+            changed = True
+    elif isinstance(prov, str) and isinstance(model, str) and prov in managed:
         mid = model.split("/", 1)[1] if "/" in model else model
         if mid not in avail.get(prov, set()):
             ids = order.get(prov, [])
@@ -945,15 +984,24 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
                     ["sudo", "pacman", "-S", "--needed", "opencode"],
                     timeout=UPDATE_TIMEOUT,
                     mutates=True,
+                    label="opencode: upgrade",
                 )
             elif st.harness == "pi":
                 binary = shutil.which("pi") or "pi"
                 run_interactive(
-                    [binary, "update", "--self"], timeout=UPDATE_TIMEOUT, mutates=True
+                    [binary, "update", "--self"],
+                    timeout=UPDATE_TIMEOUT,
+                    mutates=True,
+                    label="pi: upgrade",
                 )
             elif st.harness == "pig":
                 binary = shutil.which("pig") or "pig"
-                run_interactive([binary, "update"], timeout=UPDATE_TIMEOUT, mutates=True)
+                run_interactive(
+                    [binary, "update"],
+                    timeout=UPDATE_TIMEOUT,
+                    mutates=True,
+                    label="pig: upgrade",
+                )
             after = _read_version(st.harness, timeout)
             if DRY_RUN:
                 outcomes[st.harness] = "dry-run"
@@ -969,6 +1017,76 @@ def _upgrade_binaries(statuses: list[BinaryStatus], timeout: float) -> dict[str,
                 outcomes[st.harness] = f"updated (version now {after})"
         except ScriptError as err:
             outcomes[st.harness] = f"FAILED: {err}"
+    return outcomes
+
+
+def _extension_versions(harness: str, timeout: float) -> dict[str, str]:
+    """Installed extension versions from `<harness> list`; {} when unreadable.
+
+    `list` prints a source line (two spaces) then its install path (four spaces);
+    the version is read from the package.json at that path.
+    """
+    binary = shutil.which(harness)
+    if binary is None:
+        return {}
+    try:
+        out = run([binary, "list"], timeout=timeout, check=False)
+    except ScriptError:
+        return {}
+    found: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        if not line.startswith("    "):
+            continue
+        try:
+            meta = json.loads((Path(line.strip()) / "package.json").read_text(encoding="utf-8"))
+            found[str(meta["name"])] = str(meta["version"])
+        except (OSError, ValueError, KeyError):
+            continue
+    return found
+
+
+def _update_extensions(timeout: float) -> dict[str, str]:
+    """Run each harness's own extension updater. Must be called outside step().
+
+    Returns {harness: outcome}. pi and pig report which packages changed;
+    opencode only reports that the check ran.
+    """
+    outcomes: dict[str, str] = {}
+    for harness in ("opencode", "pi", "pig"):
+        binary = shutil.which(harness)
+        if binary is None:
+            outcomes[harness] = "skipped (not installed)"
+            continue
+        try:
+            if harness == "opencode":
+                run_interactive(
+                    [binary, "plugin", "update"],
+                    timeout=UPDATE_TIMEOUT,
+                    mutates=True,
+                    label="opencode: extensions",
+                )
+                outcomes[harness] = "dry-run" if DRY_RUN else "checked"
+                continue
+            before = _extension_versions(harness, timeout)
+            run_interactive(
+                [binary, "update", "--extensions"],
+                timeout=UPDATE_TIMEOUT,
+                mutates=True,
+                label=f"{harness}: extensions",
+            )
+            after = _extension_versions(harness, timeout)
+        except ScriptError as err:
+            outcomes[harness] = f"FAILED: {err}"
+            continue
+        changed = [
+            f"{name} {before[name]}->{ver}"
+            for name, ver in sorted(after.items())
+            if name in before and before[name] != ver
+        ]
+        if DRY_RUN:
+            outcomes[harness] = "dry-run"
+        else:
+            outcomes[harness] = f"updated: {', '.join(changed)}" if changed else "current"
     return outcomes
 
 
@@ -1022,7 +1140,8 @@ def _plan_target(
         settings_path = path.parent / "settings.json"
         if settings_path.is_file():
             fixed, notes = _fix_pi_settings(
-                harness, settings_path.read_text(encoding="utf-8"), new_data
+                harness, settings_path.read_text(encoding="utf-8"), new_data, set(catalog),
+                [(pid, m.id) for pid, ms in catalog.items() for m in ms if m.free],
             )
             for note in notes:
                 emit(f"note: {harness} settings: {note}")
@@ -1178,7 +1297,11 @@ def work(args: argparse.Namespace) -> None:
 
     # Interactive updaters need the terminal; never run them under step().
     outcomes = _upgrade_binaries(statuses, args.timeout)
+    extensions = _update_extensions(args.timeout)
     failed = {h: o for h, o in outcomes.items() if o.startswith("FAILED")}
+    failed.update(
+        {f"{h} extensions": o for h, o in extensions.items() if o.startswith("FAILED")}
+    )
     if failed:
         raise ScriptError(
             f"could not update: {', '.join(failed)}",
@@ -1193,6 +1316,15 @@ def work(args: argparse.Namespace) -> None:
         print(f"Updated programs: {', '.join(updated)}.")
     else:
         print("Programs are up to date.")
+    detail.append(f"{'plugins':<8}  " + ", ".join(f"{h} {o}" for h, o in extensions.items()))
+    ext_updated = [f"{h} ({o[9:]})" for h, o in sorted(extensions.items()) if o.startswith("updated")]
+    if DRY_RUN and any(o == "dry-run" for o in extensions.values()):
+        would = sorted(h for h, o in extensions.items() if o == "dry-run")
+        print(f"Would also update extensions: {', '.join(would)}.")
+    elif ext_updated:
+        print(f"Updated extensions: {'; '.join(ext_updated)}.")
+    else:
+        print("Extensions are up to date.")
 
     if VERBOSE:
         print("--- details ---")
